@@ -46,6 +46,11 @@ omarchy-shell omapager probe   # what the daemon believes, as JSON
 bin/omapager-demo --list       # scenes; --scene routing prints its predictions first
 ```
 
+`probe.notificationDisplays` lists the connected displays eligible to show
+notifications after fullscreen routing. It is empty when every display is
+avoided, including in mirror mode. `surfaces` separately reports whether each
+overlay is currently mapped; an eligible display can be unmapped while idle.
+
 **Hot reload does not recreate `Variants` windows.** Edit `Toast.qml`, the
 surface, or `Widget.qml` and you must restart the shell — otherwise you are
 looking at the old surface and will chase a bug that is not there. Touching any

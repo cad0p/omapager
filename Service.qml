@@ -2007,7 +2007,9 @@ Item {
         displayMode: service.displayMode, displayName: service.displayName,
         displays: service.displayNames, focusedDisplay: service.focusedDisplayName,
         targetDisplay: service.targetDisplayName,
-        notificationDisplays: service.displayMode === "all" ? service.displayNames : [service.targetDisplayName],
+        notificationDisplays: service.displayNames.filter(function(name) {
+          return (service.displayMode === "all" && !service.awayFrom(name)) || name === service.targetDisplayName
+        }),
         fullscreenOverlay: service.fullscreenOverlay, surfaces: service.surfaceStates(),
         avoidedDisplays: service.displayNames.filter(function(n) { return service.awayFrom(n) })})
     }

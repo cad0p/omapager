@@ -91,6 +91,7 @@ function extract(src, startMarker, endMarker) {
 }
 const capacitySource = [
   extract(source, 'function pinDeckDisplay()', '\n  // A verification code'),
+  extract(source, 'function fullscreenOn(name)', '\n  Connections {'),
   extract(source, 'function rememberRecent(row)', '// ------------------------------------------------------- what was held'),
   extract(source, 'function durationFor(urgency, requested)', '// ------------------------------------------------------------- snooze'),
   extract(source, 'function liveCount()', '// ------------------------------------------------------------- icons'),
@@ -120,6 +121,9 @@ function newCapacityScope() {
     recentRows: [], recentLimit: 20,
     senderImageQueue: [], senderImageRevision: 0, helperSettingsReady: false,
     configuredDisplayName: 'fixture-display', deckDisplayName: '',
+    fullscreenAway: false, fullscreenScope: '', hyprRevision: 0,
+    displayNames: ['fixture-display'], focusedDisplayName: 'fixture-display',
+    Quickshell: { screens: [] }, Hyprland: { monitorFor: screen => screen.monitor },
     snoozeRevision: 0, snoozes: {},
     codesBypassQuiet: false, hideSettingsAction: false,
     lowDuration: 5000, normalDuration: 8000, maxDuration: 30000,
@@ -175,6 +179,29 @@ function newCapacityScope() {
     return n;
   };
   return s;
+}
+
+{ // Route away from fullscreen outputs, but not merely maximised windows.
+  const s = newCapacityScope();
+  const game = { lastIpcObject: { fullscreen: 1, class: 'steam_app_31' } };
+  const work = { lastIpcObject: { fullscreen: 0, class: 'editor' } };
+  s.displayNames = ['game', 'work'];
+  s.focusedDisplayName = 'game';
+  s.Quickshell.screens = [game, work].map((window, i) => ({
+    name: s.displayNames[i],
+    monitor: { activeWorkspace: { hasFullscreen: true, toplevels: { values: [window] } } },
+  }));
+  s.fullscreenAway = true;
+  s.fullscreenScope = 'all';
+  assert.equal(s.routeAround('game'), 'game');
+  game.lastIpcObject.fullscreen = 2;
+  assert.equal(s.routeAround('game'), 'work');
+  work.lastIpcObject.fullscreen = 2;
+  assert.equal(s.routeAround('game'), '');
+  s.fullscreenScope = 'steam';
+  assert.equal(s.routeAround('game'), 'work');
+  s.fullscreenAway = false;
+  assert.equal(s.routeAround('game'), 'game');
 }
 
 { // A late decode cannot overwrite a replacement, even if it reuses the path.
