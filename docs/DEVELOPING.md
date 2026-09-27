@@ -93,6 +93,16 @@ The deck owns hover, not the cards. Refresh its hit test after scene settlement
 has removed departing rows: pointer events alone miss cards moving beneath a
 stationary pointer and leave the next close control disabled.
 
+### Stack dismissal regression
+
+In an isolated lab, send critical notifications from two sources. Check
+`notifications dismissAll` clears the open stack, or the newest visible stack
+when none is open. Switch between `source` and `all` with a stack open and
+repeat; an old open-stack key must not prevent dismissal. Press again during
+the exit animation: departing cards must not consume the next dismissal.
+`omapager clear` must still clear every stack. `node tests/security.cjs` covers
+deck selection, stale open keys, animation overlap and the empty state.
+
 ## Things that cost a day to learn
 
 **Qt/QML**

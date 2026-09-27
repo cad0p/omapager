@@ -204,6 +204,42 @@ function newCapacityScope() {
   assert.equal(s.routeAround('game'), 'game');
 }
 
+{ // Dismiss the visible deck, including across mode changes and exit animations.
+  const Layout = load('Layout');
+  function fixture(stacking, expanded, openDeck) {
+    const s = newCapacityScope();
+    Object.assign(s, { Layout, stacking, expanded, openDeck });
+    for (const [key, groupKey] of [['old', 'chat'], ['build', 'build'], ['new', 'chat']]) {
+      s.reserveLive(key);
+      s.toasts.insert(0, { key, groupKey });
+    }
+    Object.defineProperty(s, 'layout', { get: () => Layout.compute(
+      s.toasts.rows.filter(row => !s.leaving[row.key]),
+      { stacking: s.stacking, expanded: s.expanded, openDeck: s.openDeck }) });
+    return s;
+  }
+  const collapsed = fixture('source', false, '');
+  assert.equal(collapsed.clearDeck('dismissed'), 2);
+  assert.deepEqual(Object.keys(collapsed.leaving).sort(), ['new', 'old']);
+  // Departing rows remain in the model, but must not consume the next press.
+  assert.equal(collapsed.clearDeck('dismissed'), 1);
+  assert.deepEqual(Object.keys(collapsed.leaving).sort(), ['build', 'new', 'old']);
+  assert.equal(collapsed.clearDeck('dismissed'), 0);
+  const open = fixture('source', true, 'build');
+  assert.equal(open.clearDeck('dismissed'), 1);
+  assert.deepEqual(Object.keys(open.leaving), ['build']);
+  assert.equal(open.clearDeck('dismissed'), 2);
+  const all = fixture('all', true, 'chat');
+  assert.equal(all.clearDeck('dismissed'), 3);
+  assert.deepEqual(Object.keys(all.leaving).sort(), ['build', 'new', 'old']);
+  const source = fixture('source', true, 'all');
+  assert.equal(source.clearDeck('dismissed'), 2);
+  assert.deepEqual(Object.keys(source.leaving).sort(), ['new', 'old']);
+  const empty = fixture('source', false, '');
+  empty.toasts.rows = [];
+  assert.equal(empty.clearDeck('dismissed'), 0);
+}
+
 { // A late decode cannot overwrite a replacement, even if it reuses the path.
   const s = newCapacityScope();
   const n = s.fakeNotification(1, 'First icon');

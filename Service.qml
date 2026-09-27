@@ -1377,12 +1377,15 @@ Item {
   // chat thread you were done with took an unrelated build failure with it.
   // In "all" mode there is only one deck, so this is still everything.
   function clearDeck(reason) {
-    if (toasts.count === 0) return 0
-    var deck = expanded && openDeck !== "" ? openDeck
-             : Layout.deckKeyFor(toasts.get(0), stacking)
-    var keys = []
-    for (var i = 0; i < toasts.count; i++)
-      if (Layout.deckKeyFor(toasts.get(i), stacking) === deck) keys.push(toasts.get(i).key)
+    var decks = layout.decks
+    if (decks.length === 0) return 0
+    var deck = decks[0]
+    // Use current decks: the open key can outlive a close or a mode change,
+    // and rows still playing their exit animation are no longer dismissible.
+    if (expanded)
+      for (var i = 0; i < decks.length; i++)
+        if (decks[i].key === openDeck) { deck = decks[i]; break }
+    var keys = deck.rows.map(function(row) { return row.key })
     for (var k = 0; k < keys.length; k++) closeToast(keys[k], reason || "cleared")
     return keys.length
   }
