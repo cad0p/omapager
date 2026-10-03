@@ -4,6 +4,7 @@
 #   put              read one notification JSON on stdin, write it to live/
 #   close KEY WHY    move live/KEY.json into history/, trimmed to size and age
 #   drop KEY         forget a live notification without recording it
+#   icon KEY PATH    record the resolved icon path on a live/history entry
 #   restore          print the live notifications, oldest first
 #   history [N]      print the newest N history entries, newest first
 #   tidy             drop history past its age, and icons nothing has wanted
@@ -121,7 +122,8 @@ def sanitise(entry):
     # Independently defend raw helper callers and legacy state migrations.
     allowed = {"key", "originalId", "senderPid", "app", "appIcon", "summary",
                "body", "rawBody", "bodyLine", "source", "groupKey", "urgency",
-               "expireTimeout", "duration", "ts", "closed_ts", "closed_reason"}
+               "expireTimeout", "duration", "ts", "closed_ts", "closed_reason",
+               "stored_image"}
     # Scan the same bounded summary/rawBody/body fields as Store's redaction,
     # not metadata: keys/groupKey and app names can contain unrelated numbers
     # or product keywords. This independent detector strips raw tags before
@@ -186,6 +188,41 @@ def cmd_drop(key):
         os.remove(os.path.join(LIVE, safe(key) + ".json"))
     except OSError:
         pass
+    return 0
+
+
+def safe_icon_path(path):
+    """A resolved icon is a plain absolute path, never a URL or an option."""
+    value = str(path or "")
+    if (not os.path.isabs(value) or len(value) > 4096
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)):
+        raise ValueError("invalid icon path")
+    return value
+
+
+def cmd_icon(key, path):
+    """Record the resolved icon path on a notification, live or historical.
+
+    Resolution can finish after the card was dismissed, so the live file may
+    already be gone; the newest history entry for the key is the fallback.
+    Idempotent: an unchanged answer rewrites nothing."""
+    key = safe(key)
+    path = safe_icon_path(path)
+    newest = None
+    for name in os.listdir(HISTORY):
+        stamp, separator, rest = name.partition("-")
+        if (separator and rest == key + ".json" and stamp.isdigit()
+                and (newest is None or name > newest)):
+            newest = name
+    targets = [os.path.join(LIVE, key + ".json")]
+    if newest is not None:
+        targets.append(os.path.join(HISTORY, newest))
+    for target in targets:
+        entry = read_json(target)
+        if not isinstance(entry, dict) or entry.get("stored_image") == path:
+            continue
+        entry["stored_image"] = path
+        write_json(target, entry)
     return 0
 
 
@@ -313,6 +350,10 @@ def main():
         return cmd_close(args[1], args[2] if len(args) > 2 else "")
     if verb == "drop":
         return cmd_drop(args[1])
+    if verb == "icon":
+        if len(args) < 3:
+            return 2
+        return cmd_icon(args[1], args[2])
     if verb == "restore":
         json.dump(listing(LIVE), sys.stdout, separators=(",", ":"))
         return 0
