@@ -57,7 +57,7 @@ class WebDesktopMatch(unittest.TestCase):
         self.icons = self.root / "icons" / "hicolor" / "512x512" / "apps"
         self.apps.mkdir(parents=True)
         self.icons.mkdir(parents=True)
-        for name in ("proton", "x", "whatsapp", "helium", "unknown"):
+        for name in ("proton", "x", "whatsapp", "helium", "unknown", "maps"):
             (self.icons / (name + ".png")).write_bytes(png_bytes(self.Image))
         self.entry("01-helium", "Helium", "/opt/helium-browser-bin/helium-wrapper %U", "helium")
         self.entry(
@@ -71,10 +71,15 @@ class WebDesktopMatch(unittest.TestCase):
                    '"--app-launch-url-for-shortcuts-menu-item=https://x.com/messages"\n'))
         self.entry("03-proton", "Proton Mail", "/opt/helium-browser-bin/helium-wrapper --app-id=protonapp", "proton")
         self.entry("04-whatsapp", "WhatsApp Web", "/opt/helium-browser-bin/helium-wrapper --app-id=wapp", "whatsapp")
+        # A URL-scheme handler whose brand happens to be a host label. It is
+        # not an installed web app and must never answer for a site.
+        self.entry("05-maps", "Google Maps",
+                   '/usr/bin/kde-geo-uri-handler "https://www.google.com/maps/" %u', "maps")
         self.icon = load_icon_module()
         patcher = mock.patch.dict(self.icon.__dict__, {
             "APP_DIRS": [str(self.apps)],
             "ICON_DIRS": [str(self.root / "icons")],
+            "CONFIG": str(self.root / "config"),
             "CACHE": str(self.root / "cache"),
             "INDEX": str(self.root / "cache" / "index.json"),
             "load_index": lambda: {},
@@ -124,6 +129,30 @@ class WebDesktopMatch(unittest.TestCase):
         # The X entry carries an action called "Direct Messages"; a site
         # labelled "messages" must not match on that generic word.
         self.assertIsNone(self.icon.from_desktop_entries(["messages"]))
+
+    def test_generic_host_label_does_not_pick_another_apps_brand(self):
+        # "mail" is what Gmail does, not who it is: it must not match "Proton
+        # Mail" (brand "proton"). The Google Maps entry is a URL-scheme
+        # handler, not an installed web app, so it cannot answer either.
+        self.assertEqual(self.resolve("mail.google.com"), (None, "none"))
+
+    def test_generic_host_label_falls_through_to_the_notification_image(self):
+        artwork = self.root / "gmail-artwork.png"
+        artwork.write_bytes(png_bytes(self.Image))
+        hit, how = self.resolve("mail.google.com", str(artwork))
+        self.assertEqual(how, "from_image")
+        self.assertNotIn("proton", Path(hit).name)
+
+    def test_maps_handler_is_not_an_installed_web_app(self):
+        # A scheme handler with a host-shaped brand must not answer for that
+        # host; only entries Chromium installed for a site ([--app-id=]) can.
+        self.assertEqual(self.resolve("google.com"), (None, "none"))
+
+    def test_bare_web_label_never_falls_back_to_the_browser(self):
+        # The key says this is a web row. With no installed web app for
+        # "google", neither the browser's own entry nor the maps handler gets
+        # a turn through the app fallback.
+        self.assertEqual(self.resolve("google"), (None, "none"))
 
     def test_installed_web_app_beats_the_notification_image(self):
         artwork = self.root / "site-artwork.png"
