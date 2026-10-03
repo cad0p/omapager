@@ -57,7 +57,8 @@ class WebDesktopMatch(unittest.TestCase):
         self.icons = self.root / "icons" / "hicolor" / "512x512" / "apps"
         self.apps.mkdir(parents=True)
         self.icons.mkdir(parents=True)
-        for name in ("proton", "x", "whatsapp", "helium", "unknown", "maps"):
+        for name in ("proton", "x", "whatsapp", "helium", "unknown", "maps",
+                     "maps-pwa", "gmail", "amazon", "amazonmusic"):
             (self.icons / (name + ".png")).write_bytes(png_bytes(self.Image))
         self.entry("01-helium", "Helium", "/opt/helium-browser-bin/helium-wrapper %U", "helium")
         self.entry(
@@ -75,6 +76,23 @@ class WebDesktopMatch(unittest.TestCase):
         # not an installed web app and must never answer for a site.
         self.entry("05-maps", "Google Maps",
                    '/usr/bin/kde-geo-uri-handler "https://www.google.com/maps/" %u', "maps")
+        # The real installed Maps PWA carries an app id and declares the host
+        # it was installed for. Sharing the vendor word "google" with every
+        # other Google site must not let it answer any of them.
+        self.entry("06-maps-pwa", "Google Maps",
+                   '/opt/helium-browser-bin/helium-wrapper --app-id=mapsapp '
+                   '"--app-launch-url-for-shortcuts-menu-item=https://maps.google.com/"',
+                   "maps-pwa")
+        # Music sorts before the shopping app: brand matching alone would pick
+        # it for amazon.com, so only the unambiguous whole-name match may.
+        self.entry("07-amazon-music", "Amazon Music",
+                   '/opt/helium-browser-bin/helium-wrapper --app-id=amazonmusic '
+                   '"--app-launch-url-for-shortcuts-menu-item=https://music.amazon.com/"',
+                   "amazonmusic")
+        self.entry("08-amazon", "Amazon",
+                   '/opt/helium-browser-bin/helium-wrapper --app-id=amazonapp '
+                   '"--app-launch-url-for-shortcuts-menu-item=https://www.amazon.com/"',
+                   "amazon")
         self.icon = load_icon_module()
         patcher = mock.patch.dict(self.icon.__dict__, {
             "APP_DIRS": [str(self.apps)],
@@ -130,11 +148,40 @@ class WebDesktopMatch(unittest.TestCase):
         # labelled "messages" must not match on that generic word.
         self.assertIsNone(self.icon.from_desktop_entries(["messages"]))
 
-    def test_generic_host_label_does_not_pick_another_apps_brand(self):
-        # "mail" is what Gmail does, not who it is: it must not match "Proton
-        # Mail" (brand "proton"). The Google Maps entry is a URL-scheme
-        # handler, not an installed web app, so it cannot answer either.
+    def test_maps_pwa_cannot_answer_a_sibling_host_or_the_vendor_label(self):
+        # "google" is the vendor Maps and Gmail share, not a brand of its own.
+        # With only the Maps PWA installed, neither the sibling host nor the
+        # bare vendor label may select it: "mail" is what Gmail does, and must
+        # not brand-match "Proton Mail" (brand "proton") either.
         self.assertEqual(self.resolve("mail.google.com"), (None, "none"))
+        self.assertEqual(self.resolve("google"), (None, "none"))
+
+    def test_gmail_web_app_answers_its_host_never_maps(self):
+        self.entry(
+            "09-gmail", "Gmail",
+            '/opt/helium-browser-bin/helium-wrapper --app-id=gmailapp '
+            '"--app-launch-url-for-shortcuts-menu-item=https://mail.google.com/mail/u/0/"',
+            "gmail")
+        hit, how = self.resolve("mail.google.com")
+        self.assertEqual(how, "from_desktop_entries:web")
+        self.assertEqual(Path(hit).name, "gmail.png")
+
+    def test_sibling_google_host_stays_none_when_its_pwa_is_absent(self):
+        self.entry(
+            "09-gmail", "Gmail",
+            '/opt/helium-browser-bin/helium-wrapper --app-id=gmailapp '
+            '"--app-launch-url-for-shortcuts-menu-item=https://mail.google.com/mail/u/0/"',
+            "gmail")
+        # The Gmail entry declares only mail.google.com; the vendor word is not
+        # a licence to answer for its siblings.
+        for source in ("docs.google.com", "calendar.google.com"):
+            with self.subTest(source=source):
+                self.assertEqual(self.resolve(source), (None, "none"))
+
+    def test_amazon_com_prefers_the_shopping_app_not_music(self):
+        hit, how = self.resolve("amazon.com")
+        self.assertEqual(how, "from_desktop_entries:web")
+        self.assertEqual(Path(hit).name, "amazon.png")
 
     def test_generic_host_label_falls_through_to_the_notification_image(self):
         artwork = self.root / "gmail-artwork.png"
@@ -266,9 +313,15 @@ class StoreIcon(unittest.TestCase):
         self.home = Path(self.temp.name) / "home"
         self.home.mkdir()
         self.env = dict(os.environ, HOME=str(self.home), PYTHONDONTWRITEBYTECODE="1")
+        self.state = self.home / ".local/state/omarchy/omapager"
+        self.icons = self.state / "icons"
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def icon_path(self, name):
+        # Only the helper's own icon cache is ever a resolved icon.
+        return str(self.icons / name)
 
     def run_store(self, *args, payload=None):
         return subprocess.run(
@@ -276,39 +329,72 @@ class StoreIcon(unittest.TestCase):
             input=json.dumps(payload) if payload is not None else "",
             text=True, capture_output=True, env=self.env)
 
+    def test_group_key_icon_write_reaches_live_and_survives_restart(self):
+        # Service.qml keys resolution by the group key ("web:proton.me") while
+        # the files are named by slot key ("n1h8xk2"): the write has to find
+        # the row by what it says, not by its filename, or late icons never
+        # persist in production.
+        slot = "n1h8xk2"
+        icon = self.icon_path("norm-proton.png")
+        self.assertEqual(self.run_store("put", payload={
+            "key": slot, "groupKey": "web:proton.me", "app": "Helium",
+            "source": "proton.me", "summary": "reset link"}).returncode, 0)
+        self.assertEqual(self.run_store("icon", "web:proton.me", icon).returncode, 0)
+        live = self.state / "live" / (slot + ".json")
+        self.assertEqual(json.loads(live.read_text())["stored_image"], icon)
+        # A restart runs ensure()/sanitise() over every file before it reads:
+        # the icon must survive that pass, not just the write.
+        rows = json.loads(self.run_store("restore").stdout)
+        self.assertEqual([row for row in rows if row["key"] == slot][0]["stored_image"], icon)
+
     def test_icon_updates_live_then_newest_history_and_is_idempotent(self):
-        state = self.home / ".local/state/omarchy/omapager"
-        key = "web-proton-me"
-        path = str(self.home / "icons" / "norm-proton.png")
-        second = str(self.home / "icons" / "norm-proton-2.png")
-        self.assertEqual(self.run_store("put", payload={"key": key, "app": "Proton Mail"}).returncode, 0)
-        self.assertEqual(self.run_store("icon", key, path).returncode, 0)
-        live = state / "live" / (key + ".json")
+        slot = "n2m4qp"
+        group = "web:proton.me"
+        path = self.icon_path("norm-proton.png")
+        second = self.icon_path("norm-proton-2.png")
+        self.assertEqual(self.run_store("put", payload={
+            "key": slot, "groupKey": group, "app": "Proton Mail"}).returncode, 0)
+        self.assertEqual(self.run_store("icon", group, path).returncode, 0)
+        live = self.state / "live" / (slot + ".json")
         self.assertEqual(json.loads(live.read_text())["stored_image"], path)
         # Idempotent: an unchanged answer rewrites nothing, and the migration
         # ensure() runs on every verb must keep the stored path.
         before = live.stat().st_mtime_ns
-        self.assertEqual(self.run_store("icon", key, path).returncode, 0)
+        self.assertEqual(self.run_store("icon", group, path).returncode, 0)
         self.assertEqual(live.stat().st_mtime_ns, before)
-        self.assertEqual(self.run_store("close", key, "done").returncode, 0)
-        history = sorted((state / "history").glob("*-" + key + ".json"))
+        self.assertEqual(self.run_store("close", slot, "done").returncode, 0)
+        history = sorted((self.state / "history").glob("*-" + slot + ".json"))
         self.assertEqual(len(history), 1)
         self.assertEqual(json.loads(history[0].read_text())["stored_image"], path)
         # A late answer lands on the newest history entry for the key.
-        self.assertEqual(self.run_store("icon", key, second).returncode, 0)
+        self.assertEqual(self.run_store("icon", group, second).returncode, 0)
         self.assertEqual(json.loads(history[0].read_text())["stored_image"], second)
         listed = json.loads(self.run_store("history").stdout)
-        self.assertEqual([row for row in listed if row["key"] == key][0]["stored_image"], second)
+        self.assertEqual([row for row in listed if row["key"] == slot][0]["stored_image"], second)
 
-    def test_icon_rejects_bad_key_and_relative_path(self):
+    def test_icon_accepts_the_app_group_key_shape(self):
+        slot = "n7app1"
+        icon = self.icon_path("norm-helium.png")
+        self.assertEqual(self.run_store("put", payload={
+            "key": slot, "groupKey": "app:helium", "app": "Helium"}).returncode, 0)
+        self.assertEqual(self.run_store("icon", "app:helium", icon).returncode, 0)
+        live = self.state / "live" / (slot + ".json")
+        self.assertEqual(json.loads(live.read_text())["stored_image"], icon)
+
+    def test_icon_rejects_bad_selector_and_unsafe_paths(self):
         self.assertEqual(self.run_store("restore").returncode, 0)
-        self.assertNotEqual(self.run_store("icon", "../escape", "/tmp/icon.png").returncode, 0)
+        icon = self.icon_path("norm-x.png")
+        self.assertNotEqual(self.run_store("icon", "../escape", icon).returncode, 0)
         self.assertNotEqual(self.run_store("icon", "key", "relative/icon.png").returncode, 0)
+        # Anything outside the plugin's own icon cache is not an icon the
+        # store should ever hand back, however absolute it looks.
+        self.assertNotEqual(self.run_store("icon", "key", "/etc/passwd").returncode, 0)
+        self.assertNotEqual(self.run_store("icon", "key", "/tmp/../etc/passwd").returncode, 0)
         self.assertEqual(self.run_store("icon", "key").returncode, 2)
 
     def test_icon_unknown_key_is_a_noop(self):
         self.assertEqual(self.run_store("restore").returncode, 0)
-        self.assertEqual(self.run_store("icon", "missing", "/tmp/icon.png").returncode, 0)
+        self.assertEqual(self.run_store("icon", "missing", self.icon_path("norm-x.png")).returncode, 0)
 
 
 if __name__ == "__main__":

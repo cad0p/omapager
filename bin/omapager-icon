@@ -215,22 +215,41 @@ def desktop_brand(name):
     "WhatsApp Web" answers for "whatsapp" while a generic word later in the
     name must not: "Proton Mail" cannot answer for "mail.google.com". The
     whole-name slug still matches too, for senders that hand over the app's
-    full name rather than a single label."""
+    full name rather than a single label.
+
+    The heuristic has known blind spots: a leading article becomes the brand
+    ("The New York Times" brands as "the", never "nytimes"), and a name in a
+    script slug() cannot fold ("Яндекс Музыка" slugs to "") loses its brand
+    entirely. Those entries still answer where Chromium recorded the host they
+    were installed for, and otherwise the caller falls through rather than
+    guess."""
     return slug((str(name or "").split() or [""])[0])
 
 
 def from_desktop_entries(names, installed_web_apps=False):
     """A .desktop file that answers to this name, and the icon it declares.
 
-    This is what catches "app.slack.com" -> the installed Slack. A want
-    answers an entry only when it is the entry's brand (the first word of its
-    Name), the entry's whole name, or a host the entry was installed for
-    (Chromium keeps those in shortcut Exec lines). Free-text matching over
-    Exec and window-class lines is deliberately gone: every web app is run by
-    the same browser, so the browser's name appears in every one of those
-    lines and would select whichever PWA the directory happens to list first.
-    Wants are tried outermost, so a site's own labels are asked of every entry
-    before anything else can pick one for it.
+    This is what catches "app.slack.com" -> the installed Slack. Three rules
+    are tried for each wanted label, strongest first:
+
+      1. an exact host the entry was installed for (Chromium records shortcut
+         URLs in the Exec line),
+      2. the entry's whole name,
+      3. the entry's brand, the first word of its Name.
+
+    Each rule must pick exactly one entry. Ambiguity is never resolved by
+    directory order: two Amazon apps both brand "amazon", and "Amazon Music"
+    answering "amazon.com" is worse than no answer. A brand match is also
+    refused when the entry declares a host other than the one wanted - an
+    installed "Google Maps" is a web app for maps.google.com, and the shared
+    word "google" must not let it answer mail.google.com or the bare vendor
+    label. When nothing is certain the caller falls through to the site's own
+    artwork, the icon theme, or the letter tile.
+
+    Free-text matching over Exec and window-class lines is deliberately gone:
+    every web app is run by the same browser, so the browser's name appears in
+    every one of those lines and would select whichever PWA the directory
+    happens to list first.
 
     installed_web_apps limits the answers to entries Chromium installed for a
     site (marked with an app id): a browser entry or a URL-scheme handler like
@@ -263,14 +282,26 @@ def from_desktop_entries(names, installed_web_apps=False):
             entries.append((desktop_brand(fields.get("Name")),
                             slug(fields.get("Name")), hosts, fields["Icon"]))
     for want in wanted:
-        for brand, name, hosts, icon in entries:
-            if not (want == name
-                    or (len(want) >= 3 and want == brand)
-                    or want in hosts):
+        for rule in ("host", "name", "brand"):
+            matches = []
+            for brand, name, hosts, icon in entries:
+                if rule == "host":
+                    hit = want in hosts
+                elif rule == "name":
+                    hit = want == name
+                else:
+                    hit = (len(want) >= 3 and want == brand
+                           and (not hosts or want in hosts))
+                if hit:
+                    matches.append(icon)
+            if len(matches) != 1:
+                # No match at this strength, or more than one: an ambiguous
+                # answer is not an answer.
                 continue
-            found = from_icon_theme([icon])
+            found = from_icon_theme([matches[0]])
             if found:
                 return found
+            icon = matches[0]
             if (os.path.isabs(icon) and os.path.isfile(icon)
                     and any(os.path.realpath(icon).startswith(os.path.realpath(d) + os.sep) for d in ICON_DIRS)):
                 return icon
