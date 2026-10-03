@@ -2132,16 +2132,15 @@ Item {
     // route back to the conversation behind a Chromium notification, whose
     // body carries no per-chat URL. Only a live sender object is considered:
     // a row restored from disk has no actions left to invoke, and must not be
-    // closed by a call that can do nothing for it.
+    // closed by a call that can do nothing for it. The action argument cannot
+    // be omitted (Quickshell enforces arity); "" selects the default action.
     function invoke(id: string, action: string): string {
       var wanted = String(action || "")
       if (!wanted) wanted = "default"
       if (wanted.length > Security.MAX_ACTION_ID) return "none"
-      var entries = []
-      for (var key in liveKeys)
-        entries.push({ key: key, originalId: liveKeys[key].originalId,
-                       live: !!(refs[key] && refs[key].actions && refs[key].actions.length) })
-      var found = Store.findLiveKey(entries, id)
+      var found = Store.findLiveKey(Store.liveEntries(liveKeys, function(key) {
+        return !!(refs[key] && refs[key].actions && refs[key].actions.length)
+      }), id)
       if (!found) return "none"
       // An action the sender never offered is a not-found too: closing the
       // card here would take it away while reporting success for something

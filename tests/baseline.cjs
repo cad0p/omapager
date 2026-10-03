@@ -26,6 +26,18 @@ assert.equal(S.findLiveKey([dead('n1',7)],'7'),'');
 assert.equal(S.findLiveKey([],'1'),'');
 assert.equal(S.findLiveKey(null,'1'),'');
 assert.equal(S.findLiveKey([live('n1',4294967295)],'4294967295'),'n1');
+// The 32-bit ceiling is load-bearing: without it, an id one past the
+// protocol's width would resolve to a live row that carries that number.
+assert.equal(S.findLiveKey([live('n1',4294967296)],'4294967296'),'');
 for (const bad of ['',' 1','1 ','+1','-1','0','01','1.0','1e2','abc','NaN',1.5,null,undefined,{},[],'4294967296'])
   assert.equal(S.findLiveKey([live('n1',1)],bad),'');
+
+// The live set is shaped by one pure function, so the shell can pass its
+// "sender still has actions" predicate and the row shape stays pinned here.
+assert.equal(JSON.stringify(S.liveEntries({n1:{originalId:7},n2:{originalId:8}}, k=>k==='n2')),
+  JSON.stringify([{key:'n1',originalId:7,live:false},{key:'n2',originalId:8,live:true}]));
+assert.equal(S.findLiveKey(S.liveEntries({n1:{originalId:7}}, ()=>true),'7'),'n1');
+assert.equal(S.liveEntries(null).length, 0);
+assert.equal(S.liveEntries({}).length, 0);
+assert.equal(S.liveEntries({n1:{originalId:7}})[0].live, false);
 console.log('baseline: passed');
