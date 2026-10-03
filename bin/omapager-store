@@ -207,11 +207,15 @@ def cmd_drop(key):
 
 def safe_selector(name):
     """The icon verb is keyed by the group key Service.qml resolved for
-    ("web:proton.me", "app:helium"), but files are named by the slot key
-    ("n1abc"). The selector never names a path here - the files are found by
-    reading them - so it only has to refuse traversal and control characters."""
+    ("web:proton.me", "app:helium", "kdeconnect:My Phone"), but files are named
+    by the slot key ("n1abc"). The selector never names a path here - the files
+    are found by reading them - so it need only refuse what a key can never
+    contain: path separators, control characters, empties and absurd lengths,
+    not the spaces and non-ASCII labels a real group key can carry."""
     value = str(name or "")
-    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", value) or ".." in value:
+    if (not value or len(value) > 200
+            or "/" in value or "\\" in value
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)):
         raise ValueError("invalid key")
     return value
 

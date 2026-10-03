@@ -381,6 +381,16 @@ class StoreIcon(unittest.TestCase):
         live = self.state / "live" / (slot + ".json")
         self.assertEqual(json.loads(live.read_text())["stored_image"], icon)
 
+    def test_icon_accepts_real_group_keys_with_spaces_and_unicode(self):
+        for slot, group in (("n8kde", "kdeconnect:My Phone"),
+                            ("n9uni", "app:Яндекс Музыка")):
+            icon = self.icon_path("norm-" + slot + ".png")
+            self.assertEqual(self.run_store("put", payload={
+                "key": slot, "groupKey": group, "app": "KDE Connect"}).returncode, 0)
+            self.assertEqual(self.run_store("icon", group, icon).returncode, 0)
+            live = self.state / "live" / (slot + ".json")
+            self.assertEqual(json.loads(live.read_text())["stored_image"], icon)
+
     def test_icon_rejects_bad_selector_and_unsafe_paths(self):
         self.assertEqual(self.run_store("restore").returncode, 0)
         icon = self.icon_path("norm-x.png")
