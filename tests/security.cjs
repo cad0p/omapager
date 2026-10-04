@@ -103,7 +103,9 @@ const capacitySource = [
   extract(source, 'function closeToast(key, reason)', '// What the sender said can be done'),
   extract(source, 'function releaseHeld()', '// Nothing waits forever'),
   extract(source, 'function restoreRows(rows, replay)', '\n  Process {'),
-  extract(source, 'function actionsOf(key, revision)', 'function invokeAction(key, identifier)'),
+  extract(source, 'function actionsForRef(ref)', '\n  // ------------------------------------------------------- source routing'),
+  extract(source, '    function invoke(id: string, action: string): string {', '\n    // Take one of the front card')
+    .replace('(id: string, action: string): string', '(id, action)'),
 ].join('\n');
 
 function newCapacityScope() {
@@ -116,6 +118,7 @@ function newCapacityScope() {
   const later = [];
   const s = {
     toasts, refs: {}, refsRevision: 0, keySeed: 0, liveKeys: Object.create(null),
+    retained: Object.create(null), retainedLimit: 100, historyHours: 24,
     maxLiveNotifications: 100, heights: {}, leaving: {}, layoutRevision: 0,
     replyingKey: '', held: [], doNotDisturb: false, globalSnoozeUntil: 0,
     recentRows: [], recentLimit: 20,
@@ -160,7 +163,8 @@ function newCapacityScope() {
       n.closed.emit();
     };
     const n = { id, summary, body: 'Synthetic body: ' + summary, urgency, appName: 'Fixture',
-      actions: [{ identifier: 'open', text: summary }], dismissals: 0, expiries: 0,
+      actions: [{ identifier: 'open', text: summary, invoke: () => { n.invokes++; } }],
+      invokes: 0, dismissals: 0, expiries: 0,
       closeAttempts: 0, destroyedCloseAttempts: 0, closed: signal(),
       get tracked() { return tracked; },
       set tracked(value) { if (value) tracked = true; else close('dismissed'); },
@@ -223,9 +227,84 @@ function newCapacityScope() {
   assert.equal(s.leaving[keys[0]], 'expired', 'dismissal preserves an earlier expiry');
   for (const key of keys) s.finishClose(key, s.leaving[key]);
   assert.equal(s.toasts.count, 0);
-  assert.equal(senders[3].expiries, 1);
+  // The expired card keeps its sender, exactly once: dismissing the others
+  // must not close it, and moving it to retention is not a close either.
+  assert.equal(senders[3].expiries, 0, 'expiry retains instead of expiring');
+  assert.equal(senders[3].closeAttempts, 0);
+  assert.equal(senders[3].tracked, true);
+  assert.equal(s.retained[keys[0]].ref, senders[3]);
   for (const sender of senders.slice(0, 3)) assert.equal(sender.dismissals, 1);
-  for (const sender of senders) assert.equal(sender.closeAttempts, 1);
+  for (const sender of senders.slice(0, 3)) assert.equal(sender.closeAttempts, 1);
+  s.releaseRetained(keys[0], 'dismissed');
+  assert.equal(senders[3].dismissals, 1);
+  assert.equal(senders[3].closeAttempts, 1, 'release closes exactly once');
+}
+
+{ // Retained actions: an expired toast keeps its sender, a late invoke fires
+  // the offer once and releases it, and pruning bounds the set by the same
+  // window and cap as history - releasing what it drops exactly once.
+  const s = newCapacityScope();
+  s.historyHours = 1;
+  const n = s.fakeNotification(7, 'Retained');
+  s.handleNotification(n);
+  s.drainCallLater();
+  const key = s.keyForOriginal(7);
+  s.finishClose(key, 'expired');
+  assert.equal(s.retained[key].ref, n, 'expiry retains the sender');
+  assert.equal(s.invoke('7', 'open'), 'open', 'a retained id resolves');
+  assert.equal(n.invokes, 1, 'the offered action fires');
+  assert.equal(n.dismissals, 1, 'a successful invoke releases the sender');
+  assert.equal(n.closeAttempts, 1);
+  assert.equal(s.retained[key], undefined);
+  assert.equal(s.invoke('7', 'open'), 'none', 'the released sender is no longer selectable');
+  assert.equal(n.invokes, 1);
+  assert.equal(n.closeAttempts, 1, 'a miss must not close anything');
+
+  // An action the sender never offered is a miss, and leaves the slot alone.
+  const other = s.fakeNotification(8);
+  s.handleNotification(other);
+  s.drainCallLater();
+  const otherKey = s.keyForOriginal(8);
+  s.finishClose(otherKey, 'expired');
+  assert.equal(s.invoke('8', 'settings'), 'none');
+  assert.equal(other.invokes, 0);
+  assert.equal(other.closeAttempts, 0, 'a rejected action must not close the retained sender');
+  assert.equal(s.retained[otherKey].ref, other);
+
+  // Age and cap follow the history policy; a prune closes what it drops.
+  s.retained[otherKey].ts = Date.now() / 1000 - 2 * 3600;
+  s.pruneRetained();
+  assert.equal(s.retained[otherKey], undefined);
+  assert.equal(other.expiries, 1, 'an aged-out sender is expired');
+  assert.equal(other.closeAttempts, 1);
+  s.retainedLimit = 1;
+  const third = s.fakeNotification(9);
+  s.handleNotification(third);
+  s.drainCallLater();
+  const thirdKey = s.keyForOriginal(9);
+  s.finishClose(thirdKey, 'expired');
+  const fourth = s.fakeNotification(10);
+  s.handleNotification(fourth);
+  s.drainCallLater();
+  const fourthKey = s.keyForOriginal(10);
+  s.finishClose(fourthKey, 'expired');
+  assert.equal(Object.keys(s.retained).length, 1, 'the cap bounds the retained set');
+  assert.equal(s.retained[fourthKey].ref, fourth, 'the newest sender survives');
+  assert.equal(third.expiries, 1, 'the capped-out sender is expired, not orphaned');
+  assert.equal(third.closeAttempts, 1);
+
+  // A retained sender can also be withdrawn from outside; the slot goes, but
+  // nothing tries to close an object that already closed itself.
+  const closed = s.fakeNotification(11);
+  s.handleNotification(closed);
+  s.drainCallLater();
+  const closedKey = s.keyForOriginal(11);
+  s.finishClose(closedKey, 'expired');
+  assert.equal(s.retained[closedKey].ref, closed);
+  closed.tracked = false;
+  assert.equal(s.retained[closedKey], undefined, 'an external close releases the slot');
+  assert.equal(closed.closeAttempts, 1);
+  assert.equal(closed.destroyedCloseAttempts, 0, 'an external close is not closed a second time');
 }
 
 { // Dismiss the visible deck, including across mode changes and exit animations.
@@ -420,12 +499,21 @@ for (const held of [true, false]) {
   s.finishClose(key, 'expired');
   s.drainCallLater();
   assert.equal(s.toasts.count, 99, 'a pending visible update cannot resurrect a closed card');
+  // The expired sender is retained, not closed: no close signal reached it,
+  // and the repeated finishClose could not release it twice.
+  assert.equal(updated.expiries, 0);
+  assert.equal(updated.closeAttempts, 0);
+  assert.equal(updated.destroyedCloseAttempts, 0);
+  assert.equal(updated.tracked, true);
+  assert.equal(s.retained[key].ref, updated);
+  assert.equal(s.actionsOf(key).length, 0);
+  assert.equal(s.liveCount(), 99);
+  s.releaseRetained(key, 'expired');
   assert.equal(updated.expiries, 1);
   assert.equal(updated.closeAttempts, 1, 'expire must not be followed by a second close via tracked=false');
   assert.equal(updated.destroyedCloseAttempts, 0);
   assert.equal(updated.tracked, false);
-  assert.equal(s.actionsOf(key).length, 0);
-  assert.equal(s.liveCount(), 99);
+  assert.equal(s.retained[key], undefined);
 }
 
 for (const held of [true, false]) {
