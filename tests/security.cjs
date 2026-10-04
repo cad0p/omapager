@@ -98,6 +98,16 @@ function extract(src, startMarker, endMarker) {
   if (e < 0) throw new Error('end marker not found: ' + endMarker);
   return src.slice(s, e);
 }
+// Extract a production function without its QML-only type annotations. The
+// whole function is sliced by marker and everything up to its opening brace
+// is replaced by a plain JavaScript header, so neither a renamed argument nor
+// a changed first statement can silently drop out of the extracted body.
+function extractUntyped(src, startMarker, endMarker, header) {
+  const text = extract(src, startMarker, endMarker);
+  const brace = text.indexOf('{');
+  if (brace < 0) throw new Error('opening brace not found: ' + startMarker);
+  return header + text.slice(brace + 1);
+}
 const capacitySource = [
   extract(source, 'function pinDeckDisplay()', '\n  // A verification code'),
   extract(source, 'function fullscreenOn(name)', '\n  Connections {'),
@@ -113,8 +123,8 @@ const capacitySource = [
   extract(source, 'function releaseHeld()', '// Nothing waits forever'),
   extract(source, 'function restoreRows(rows, replay)', '\n  Process {'),
   extract(source, 'function actionsForRef(ref)', '\n  // ------------------------------------------------------- source routing'),
-  extract(source, '    function invoke(id: string, action: string): string {', '\n    // Take one of the front card')
-    .replace('(id: string, action: string): string', '(id, action)'),
+  extractUntyped(source, 'function invoke(', '\n    // Take one of the front card',
+                 'function invoke(id, action) {'),
 ].join('\n');
 
 function newCapacityScope() {
@@ -314,6 +324,73 @@ function newCapacityScope() {
   assert.equal(s.retained[closedKey], undefined, 'an external close releases the slot');
   assert.equal(closed.closeAttempts, 1);
   assert.equal(closed.destroyedCloseAttempts, 0, 'an external close is not closed a second time');
+}
+
+{ // A replaces_id update to a retained sender must become a card again, and
+  // the retained slot must not be left for a prune or a late invoke to hit.
+  const s = newCapacityScope();
+  const n = s.fakeNotification(21, 'Before expiry');
+  s.handleNotification(n);
+  s.drainCallLater();
+  const key = s.keyForOriginal(21);
+  s.finishClose(key, 'expired');
+  assert.equal(s.retained[key].ref, n, 'the action-bearing sender is retained');
+
+  let revision = s.refsRevision;
+  n.replace({ summary: 'Replacement', body: 'Replacement body' });
+  s.drainCallLater();
+  assert.equal(s.retained[key], undefined, 'the update releases the retained slot');
+  assert.equal(s.toasts.count, 1, 'the replacement becomes a card');
+  assert.equal(s.toasts.get(0).summary, 'Replacement');
+  assert.equal(s.toasts.get(0).key, key, 'the reclaimed slot key is reused');
+  assert.equal(s.refsRevision, revision + 1, 'exactly one watcher handled the update');
+  assert.equal(n.tracked, true, 'the sender was never closed');
+  assert.equal(n.closeAttempts, 0, 're-adoption closes nothing');
+
+  // The same lone watcher keeps the card current on the next replace; a
+  // second watcher would run handleNotification twice per update.
+  revision = s.refsRevision;
+  n.replace({ summary: 'Second replacement' });
+  s.drainCallLater();
+  assert.equal(s.toasts.get(0).summary, 'Second replacement');
+  assert.equal(s.refsRevision, revision + 1, 'still exactly one watcher');
+
+  // The card is now an ordinary live sender: invoke reaches it and closes it.
+  assert.equal(s.invoke('21', 'open'), 'open');
+  assert.equal(n.invokes, 1);
+  assert.equal(s.leaving[key], 'activated');
+}
+
+{ // Retention is action-scoped: a notification with nothing to invoke must
+  // expire and close as it always did, so notificationclose still fires.
+  const s = newCapacityScope();
+  const bare = s.fakeNotification(22, 'Bare toast');
+  bare.actions = [];
+  s.handleNotification(bare);
+  s.drainCallLater();
+  const key = s.keyForOriginal(22);
+  s.finishClose(key, 'expired');
+  assert.equal(s.retained[key], undefined, 'no actions means no retention');
+  assert.equal(bare.expiries, 1, 'expire is called exactly once');
+  assert.equal(bare.closeAttempts, 1);
+  assert.equal(bare.destroyedCloseAttempts, 0);
+  assert.equal(bare.tracked, false);
+}
+
+{ // The age bound is evaluated on use, not only when the set grows: an
+  // invoke after the window must not reach a slot the policy already let go.
+  const s = newCapacityScope();
+  s.historyHours = 1;
+  const stale = s.fakeNotification(23, 'Stale');
+  s.handleNotification(stale);
+  s.drainCallLater();
+  const key = s.keyForOriginal(23);
+  s.finishClose(key, 'expired');
+  s.retained[key].ts = Date.now() / 1000 - 2 * 3600;
+  assert.equal(s.invoke('23', 'open'), 'none', 'a stale slot is pruned before selection');
+  assert.equal(stale.invokes, 0);
+  assert.equal(stale.expiries, 1, 'the pruned sender expires exactly once');
+  assert.equal(s.retained[key], undefined);
 }
 
 { // Dismiss the visible deck, including across mode changes and exit animations.

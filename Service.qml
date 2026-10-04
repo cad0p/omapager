@@ -686,11 +686,13 @@ Item {
   readonly property int maxLiveNotifications: 100
   property var liveKeys: Object.create(null)
 
-  // Expired notifications whose sender is kept alive. The toast is gone, but
-  // the sender's own "default" action is the only route back to the
-  // conversation behind a Chromium notification, and a Threads-panel click
-  // can arrive long after the toast has expired. Keeping the Notification
-  // object tracked is what lets `invoke` fire that action later.
+  // Expired notifications that offered actions, whose sender is kept alive.
+  // The toast is gone, but the sender's own "default" action is the only
+  // route back to the conversation behind a Chromium notification, and a
+  // Threads-panel click can arrive long after the toast has expired. Keeping
+  // the Notification object tracked is what lets `invoke` fire that action
+  // later. A sender with nothing to invoke expires as it always did, so a
+  // bare toast still fires `notificationclose`.
   //
   // Session-scoped: nothing here is written to disk, so a shell restart drops
   // every entry and those notifications close with the old shell. Note also
@@ -701,6 +703,15 @@ Item {
   // retainedLimit, oldest released first.
   property var retained: Object.create(null)
   readonly property int retainedLimit: 100
+  // The age bound is otherwise only evaluated when the set grows or the
+  // window changes, so a quiet spell could keep a sender past historyHours.
+  // A coarse sweep closes that gap without waiting for a new notification.
+  Timer {
+    interval: 10 * 60 * 1000
+    repeat: true
+    running: true
+    onTriggered: service.pruneRetained()
+  }
 
   function liveCount() { return Object.keys(liveKeys).length }
 
@@ -1195,8 +1206,13 @@ Item {
 
   // ------------------------------------------------------------- arrival
   function handleNotification(notification) {
+    var liveKey = keyForOriginal(notification.id)
+    // A replaces_id update to a retained sender mutates the tracked object
+    // in place instead of emitting onNotification; reclaim its slot so the
+    // update becomes a card again instead of vanishing behind the retention.
+    var adopted = adoptRetained(notification, liveKey)
     // Replacements reuse the same slot, including before its first insertion.
-    var key = keyForOriginal(notification.id) || nextKey()
+    var key = (adopted && adopted.key) || liveKey || nextKey()
 
     // Without this the object is destroyed as soon as this handler returns,
     // taking the actions and the image with it.
@@ -1217,7 +1233,10 @@ Item {
     // card's action buttons are bound through this counter, or they would be
     // read once - before the sender was recorded - and stay empty forever.
     refsRevision += 1
-    if (previous !== notification) watchNotification(notification, key)
+    // A reclaimed retained sender already has its one watcher attached; only
+    // a newly seen object gets a new one.
+    if (previous !== notification && !(adopted && adopted.sameRef))
+      watchNotification(notification, key)
     if (previous && previous !== notification) {
       try { previous.tracked = false } catch (e) {}
     }
@@ -1259,6 +1278,28 @@ Item {
     service.showRow(row)
   }
 
+  // A retained sender that speaks again must come back to life. A replaces_id
+  // update mutates the still-tracked object in place instead of arriving as a
+  // new notification; left in `retained`, the replacement would never become
+  // a card or a history row, and a later prune would `expire()` it out from
+  // under the sender that is still waiting on it. Drop the slot without
+  // closing anything - this sender never closed - and report the key so the
+  // arrival path reuses it. `sameRef` marks the object as already watched, so
+  // exactly one watcher survives; the id branch catches a fresh object
+  // reusing an id whose sender is still retained.
+  function adoptRetained(notification, liveKey) {
+    for (var key in retained) {
+      var slot = retained[key]
+      if (!slot) continue
+      var sameRef = slot.ref === notification
+      if (sameRef || (!liveKey && notification.id && Number(slot.id || 0) === Number(notification.id))) {
+        delete retained[key]
+        return { key: key, sameRef: sameRef }
+      }
+    }
+    return null
+  }
+
   function watchNotification(notification, key) {
     var reservation = liveKeys[key]
     notification.closed.connect(function() {
@@ -1278,17 +1319,38 @@ Item {
     })
     // NotificationServer emits onNotification only for new objects. A
     // replaces_id update mutates this QObject and emits its property signals.
-    // Snapshot once after the whole update, not once per changed field.
+    // Snapshot once after the whole update, not once per changed field. The
+    // sender's identity, not the reservation's, is what keeps the watcher
+    // valid: a retained sender reclaims its slot and keeps this one watcher,
+    // so its old reservation is gone by then.
     var queued = false
+    var queuedRetained = false
     var refresh = function() {
       if (!queued) return
       queued = false
+      var wasRetained = queuedRetained
+      queuedRetained = false
       if (reservation.refresh === refresh) reservation.refresh = null
-      if (service.liveKeys[key] !== reservation || service.refs[key] !== notification) return
-      service.handleNotification(notification)
+      if (service.refs[key] === notification) {
+        service.handleNotification(notification)
+        return
+      }
+      // An update that arrived while the sender was retained must bring it
+      // back; one queued while it was live must not resurrect a card that
+      // expired (or was closed) before the snapshot ran.
+      if (!wasRetained) return
+      var slot = service.retained[key]
+      if (slot && slot.ref === notification) service.handleNotification(notification)
     }
     var schedule = function() {
-      if (queued || service.liveKeys[key] !== reservation || service.refs[key] !== notification) return
+      if (queued) return
+      if (service.refs[key] === notification) {
+        queuedRetained = false
+      } else {
+        var slot = service.retained[key]
+        if (!(slot && slot.ref === notification)) return
+        queuedRetained = true
+      }
       queued = true
       reservation.refresh = refresh
       Qt.callLater(refresh)
@@ -1347,10 +1409,13 @@ Item {
   }
 
   // Let go of the sender's object. Untracking tells it the notification
-  // closed, which is when Chromium deletes the avatar it handed us. An
-  // expired notification is the one exception: the toast is gone, but its
-  // sender's action is still worth having, so it moves to `retained` instead
-  // of closing. Explicit dismiss/clear/activate still close it here.
+  // closed, which is when Chromium deletes the avatar it handed us. Expiry
+  // is the one reason that can wait: a toast that expired with actions still
+  // on offer keeps its sender so `invoke` can reach it, and moves to
+  // `retained` instead of closing. A toast with nothing to invoke expires
+  // like anything else, so a bare `notify-send` or a system popup still fires
+  // `notificationclose` and the app can clear its badge. Explicit dismiss,
+  // clear and activate always close here.
   function release(key, reason) {
     var ref = refs[key]
     if (!ref) return
@@ -1358,16 +1423,18 @@ Item {
     // synchronously and must not cancel a row or release a newer sender.
     delete refs[key]
     refsRevision += 1
-    if (reason === "expired") {
+    if (reason === "expired" && ref.actions && ref.actions.length) {
       retained[key] = { ref: ref, id: ref.id || 0, ts: Date.now() / 1000 }
       pruneRetained()
       return
     }
     // Untracking itself dismisses the notification. Do exactly one close:
     // dismiss()/tracked=false have already destroyed or detached it before
-    // they return.
+    // they return. Expiry has a closer of its own so the sender sees the
+    // timeout it asked for rather than a dismissal.
     try {
-      if (reason) ref.dismiss()
+      if (reason === "expired") ref.expire()
+      else if (reason) ref.dismiss()
       else ref.tracked = false
     } catch (e) {}
   }
@@ -2097,6 +2164,9 @@ Item {
     // asked in anger: where would a click go, did the reply channel resolve,
     // which of the sender's actions survived, how tall is each card.
     function probe(): string {
+      // Report the set the policy allows right now, not the one a quiet spell
+      // left behind: the same sweep `invoke` runs before selecting.
+      service.pruneRetained()
       return JSON.stringify({fontScale: service.fontScale, toasts: toasts.count,
         retained: Object.keys(service.retained).length,
         doNotDisturb: service.doNotDisturb, expanded: service.expanded,
@@ -2217,6 +2287,10 @@ Item {
     // The action argument cannot be omitted (Quickshell enforces arity); ""
     // selects the default action.
     function invoke(id: string, action: string): string {
+      // The age bound must not wait for the next arrival: release anything
+      // past the window before it can be selected, so a late invoke can never
+      // reach a sender the policy already let go.
+      service.pruneRetained()
       var wanted = String(action || "")
       if (!wanted) wanted = "default"
       if (wanted.length > Security.MAX_ACTION_ID) return "none"
