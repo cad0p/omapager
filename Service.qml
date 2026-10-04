@@ -2430,6 +2430,19 @@ Item {
       return keys.length ? "ok" : "none"
     }
 
+    // Dismiss a live card by the daemon id the caller already holds, so a
+    // sensitive summary never has to travel through process arguments. The
+    // id is checked against the live set only: a closed card is not here to
+    // dismiss, and a stale id must not close a newer card that reused it.
+    function dismissId(id: string): string {
+      var found = Store.findLiveKey(Store.liveEntries(liveKeys, function(key) {
+        return !!refs[key]
+      }), id)
+      if (!found) return "none"
+      service.closeToast(found, "dismissed")
+      return "ok"
+    }
+
     function ping(): string { return "ok" }
   }
 
