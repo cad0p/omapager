@@ -37,8 +37,9 @@ for (const bad of ['',' 1','1 ','+1','-1','0','01','1.0','1e2','abc','NaN',1.5,n
 assert.equal(JSON.stringify(S.liveEntries({n1:{originalId:7},n2:{originalId:8}}, k=>k==='n2')),
   JSON.stringify([{key:'n1',originalId:7,live:false},{key:'n2',originalId:8,live:true}]));
 assert.equal(S.findLiveKey(S.liveEntries({n1:{originalId:7}}, ()=>true),'7'),'n1');
-// dismissId looks up with an always-live predicate: any live card, not only
-// action-bearing ones, is dismissable by id, and a miss stays a miss.
+// The lookup dismissId uses is pinned here: an always-live predicate, so any
+// live card is dismissable by id, and a miss stays a miss. The IPC verb
+// itself is QML and is exercised live.
 assert.equal(S.findLiveKey(S.liveEntries({n1:{originalId:7}}, ()=>true),'8'),'');
 assert.equal(S.liveEntries(null).length, 0);
 assert.equal(S.liveEntries({}).length, 0);

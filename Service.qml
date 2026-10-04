@@ -2453,7 +2453,9 @@ Item {
       var found = Store.findLiveKey(Store.liveEntries(liveKeys, function(key) {
         return !!refs[key]
       }), id)
-      if (!found) return "none"
+      // A card already playing its exit is not here to dismiss any more, and
+      // closeToast would quietly do nothing; answer what actually happened.
+      if (!found || service.leaving[found]) return "none"
       service.closeToast(found, "dismissed")
       return "ok"
     }
