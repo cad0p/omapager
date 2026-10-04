@@ -71,8 +71,15 @@ Item {
     interval: 1
     onTriggered: sandboxProbe.running = true
   }
+  // The retention window retained actions share with history. The widget
+  // pushes the chosen value; 24 is the store's default and the value used
+  // until settings arrive.
+  property int historyHours: 24
   function setHistoryHours(hours) {
-    Store.write(storeProc, storeBin, "policy", {historyHours: hours})
+    var value = Number(hours)
+    historyHours = (isFinite(value) && value >= 0) ? value : 24
+    Store.write(storeProc, storeBin, "policy", {historyHours: historyHours})
+    pruneRetained()
   }
 
   // Which variant of a site's icon to ask for. Derived from the theme's own
@@ -679,6 +686,22 @@ Item {
   readonly property int maxLiveNotifications: 100
   property var liveKeys: Object.create(null)
 
+  // Expired notifications whose sender is kept alive. The toast is gone, but
+  // the sender's own "default" action is the only route back to the
+  // conversation behind a Chromium notification, and a Threads-panel click
+  // can arrive long after the toast has expired. Keeping the Notification
+  // object tracked is what lets `invoke` fire that action later.
+  //
+  // Session-scoped: nothing here is written to disk, so a shell restart drops
+  // every entry and those notifications close with the old shell. Note also
+  // that `notificationclose` does not fire for an expired-but-retained
+  // notification, so an app that clears a badge on close will not see it
+  // until the entry is released (invoked, pruned by age/cap, or cleared).
+  // Bounded like history: nothing older than historyHours, never more than
+  // retainedLimit, oldest released first.
+  property var retained: Object.create(null)
+  readonly property int retainedLimit: 100
+
   function liveCount() { return Object.keys(liveKeys).length }
 
   function reserveLive(key) {
@@ -1150,7 +1173,7 @@ Item {
     do {
       keySeed += 1
       key = "n" + Date.now().toString(36) + keySeed.toString(36)
-    } while (liveKeys[key])
+    } while (liveKeys[key] || retained[key])
     return key
   }
 
@@ -1239,12 +1262,19 @@ Item {
   function watchNotification(notification, key) {
     var reservation = liveKeys[key]
     notification.closed.connect(function() {
-      if (service.refs[key] !== notification) return
-      delete service.refs[key]
-      service.refsRevision += 1
-      // Visible snapshots outlive their sender; pending rows must not appear
-      // after the sender withdraws them.
-      if (service.rowIndexFor(key) < 0) service.finishClose(key, "closed")
+      if (service.refs[key] === notification) {
+        delete service.refs[key]
+        service.refsRevision += 1
+        // Visible snapshots outlive their sender; pending rows must not appear
+        // after the sender withdraws them.
+        if (service.rowIndexFor(key) < 0) service.finishClose(key, "closed")
+      }
+      // A retained sender can be closed from outside too: the app itself, or
+      // the user acting on Chromium's own bubble. Drop the slot so `invoke`
+      // never selects a dead wrapper; when we close it ourselves the slot was
+      // already cleared before this signal ran.
+      var retainedSlot = service.retained[key]
+      if (retainedSlot && retainedSlot.ref === notification) service.releaseRetained(key, "closed")
     })
     // NotificationServer emits onNotification only for new objects. A
     // replaces_id update mutates this QObject and emits its property signals.
@@ -1317,7 +1347,10 @@ Item {
   }
 
   // Let go of the sender's object. Untracking tells it the notification
-  // closed, which is when Chromium deletes the avatar it handed us.
+  // closed, which is when Chromium deletes the avatar it handed us. An
+  // expired notification is the one exception: the toast is gone, but its
+  // sender's action is still worth having, so it moves to `retained` instead
+  // of closing. Explicit dismiss/clear/activate still close it here.
   function release(key, reason) {
     var ref = refs[key]
     if (!ref) return
@@ -1325,13 +1358,47 @@ Item {
     // synchronously and must not cancel a row or release a newer sender.
     delete refs[key]
     refsRevision += 1
+    if (reason === "expired") {
+      retained[key] = { ref: ref, id: ref.id || 0, ts: Date.now() / 1000 }
+      pruneRetained()
+      return
+    }
     // Untracking itself dismisses the notification. Do exactly one close:
-    // dismiss()/expire() have already destroyed it before they return.
+    // dismiss()/tracked=false have already destroyed or detached it before
+    // they return.
     try {
-      if (reason === "expired") ref.expire()
-      else if (reason) ref.dismiss()
+      if (reason) ref.dismiss()
       else ref.tracked = false
     } catch (e) {}
+  }
+
+  // Closing a retained sender is one-way, like release(): drop the slot
+  // first so a synchronous close signal cannot release it twice. "closed"
+  // means the sender already went away on its own - dropping the slot is the
+  // whole job, and touching the object would be unsafe.
+  function releaseRetained(key, reason) {
+    var slot = retained[key]
+    if (!slot) return
+    delete retained[key]
+    if (reason === "closed") return
+    try {
+      if (reason === "expired") slot.ref.expire()
+      else if (reason) slot.ref.dismiss()
+      else slot.ref.tracked = false
+    } catch (e) {}
+  }
+
+  function releaseAllRetained(reason) {
+    var keys = Object.keys(retained)
+    for (var i = 0; i < keys.length; i++) releaseRetained(keys[i], reason)
+  }
+
+  // Bound the retained set the moment it grows, with the same policy as
+  // history: nothing past the configured window, nothing over the store's cap.
+  function pruneRetained() {
+    var drop = Store.pruneRetained(Store.retainedEntries(retained), Date.now() / 1000,
+                                   historyHours, retainedLimit)
+    for (var i = 0; i < drop.length; i++) releaseRetained(drop[i], "expired")
   }
 
   // ------------------------------------------------------------- departure
@@ -1386,6 +1453,7 @@ Item {
     // script clears before it starts.
     var keys = Object.keys(liveKeys)
     for (var k = 0; k < keys.length; k++) closeToast(keys[k], reason || "cleared")
+    releaseAllRetained("dismissed")
   }
 
   // One stack's worth of clearAll: the deck the pointer has open, or else the
@@ -1412,9 +1480,10 @@ Item {
   // the rest. A restored row has no live sender, so it has none of these.
   property int refsRevision: 0
 
-  function actionsOf(key, revision) {
+  // The sender's own offers, read off whichever object holds it: a card's
+  // live sender, or a retained one whose toast has already expired.
+  function actionsForRef(ref) {
     var out = []
-    var ref = refs[key]
     if (!ref || !ref.actions) return out
     for (var i = 0; i < Math.min(ref.actions.length, Security.MAX_ACTIONS); i++) {
       var a = ref.actions[i]
@@ -1429,17 +1498,23 @@ Item {
     return out
   }
 
-  function invokeAction(key, identifier) {
-    if (typeof identifier !== "string" || identifier.length > Security.MAX_ACTION_ID) return
-    var ref = refs[key]
-    if (ref && ref.actions) {
-      for (var i = 0; i < Math.min(ref.actions.length, Security.MAX_ACTIONS); i++) {
-        if (String(ref.actions[i].identifier) === identifier) {
-          try { ref.actions[i].invoke() } catch (e) {}
-          break
-        }
+  function actionsOf(key, revision) {
+    return actionsForRef(refs[key])
+  }
+
+  function invokeOnRef(ref, identifier) {
+    if (!ref || !ref.actions) return
+    for (var i = 0; i < Math.min(ref.actions.length, Security.MAX_ACTIONS); i++) {
+      if (String(ref.actions[i].identifier) === identifier) {
+        try { ref.actions[i].invoke() } catch (e) {}
+        break
       }
     }
+  }
+
+  function invokeAction(key, identifier) {
+    if (typeof identifier !== "string" || identifier.length > Security.MAX_ACTION_ID) return
+    invokeOnRef(refs[key], identifier)
     closeToast(key, "activated")
   }
 
@@ -1982,6 +2057,10 @@ Item {
     environment: service.helperEnvironment
     running: false
     command: [service.storeBin, "tidy"]
+    // Retention is session-scoped, so there is normally nothing here at
+    // startup; releasing anyway means a reload can never inherit stale
+    // senders. Its mirror of history's housekeeping.
+    onExited: service.releaseAllRetained("expired")
   }
 
   // Wait for the bar widget's saved policy before any helper can run. Otherwise
@@ -2019,6 +2098,7 @@ Item {
     // which of the sender's actions survived, how tall is each card.
     function probe(): string {
       return JSON.stringify({fontScale: service.fontScale, toasts: toasts.count,
+        retained: Object.keys(service.retained).length,
         doNotDisturb: service.doNotDisturb, expanded: service.expanded,
         hasWlCopy: service.hasWlCopy, security: service.sandboxStatus,
         fetchRemoteIcons: service.fetchIcons,
@@ -2130,10 +2210,12 @@ Item {
     // notification the front card is not. The daemon id is the one handle
     // both sides share, and the sender's live "default" action is the only
     // route back to the conversation behind a Chromium notification, whose
-    // body carries no per-chat URL. Only a live sender object is considered:
-    // a row restored from disk has no actions left to invoke, and must not be
-    // closed by a call that can do nothing for it. The action argument cannot
-    // be omitted (Quickshell enforces arity); "" selects the default action.
+    // body carries no per-chat URL. A live sender is preferred; one whose
+    // toast merely expired lives on in `retained` and is released by the
+    // invocation that used it. A row restored from disk has no actions left
+    // to invoke, and must not be closed by a call that can do nothing for it.
+    // The action argument cannot be omitted (Quickshell enforces arity); ""
+    // selects the default action.
     function invoke(id: string, action: string): string {
       var wanted = String(action || "")
       if (!wanted) wanted = "default"
@@ -2141,16 +2223,32 @@ Item {
       var found = Store.findLiveKey(Store.liveEntries(liveKeys, function(key) {
         return !!(refs[key] && refs[key].actions && refs[key].actions.length)
       }), id)
-      if (!found) return "none"
+      var ref = found ? refs[found] : null
+      var retainedHit = false
+      if (!found) {
+        found = Store.findRetainedKey(Store.retainedEntries(retained), id)
+        var slot = found ? retained[found] : null
+        ref = slot ? slot.ref : null
+        retainedHit = !!ref
+      }
+      if (!found || !ref) return "none"
       // An action the sender never offered is a not-found too: closing the
       // card here would take it away while reporting success for something
       // that never ran.
-      var offered = service.actionsOf(found, service.refsRevision)
+      var offered = service.actionsForRef(ref)
       var present = false
       for (var i = 0; i < offered.length; i++)
         if (offered[i].id === wanted) { present = true; break }
       if (!present) return "none"
-      service.invokeAction(found, wanted)
+      if (retainedHit) {
+        // Invoke, then release: the action must run while the sender is still
+        // tracked, and the close is what tells the app the card is done.
+        // Only a successful invocation reaches here.
+        service.invokeOnRef(ref, wanted)
+        service.releaseRetained(found, "dismissed")
+      } else {
+        service.invokeAction(found, wanted)
+      }
       return wanted
     }
 
@@ -2252,6 +2350,7 @@ Item {
     // Forgets what was recorded. What is on screen stays where it is.
     function clear(): string {
       Store.write(storeProc, storeBin, "forget-all", null)
+      service.releaseAllRetained("dismissed")
       service.heldRows = []
       service.heldRevision += 1
       service.historyRows = []

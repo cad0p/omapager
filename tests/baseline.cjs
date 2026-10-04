@@ -40,4 +40,38 @@ assert.equal(S.findLiveKey(S.liveEntries({n1:{originalId:7}}, ()=>true),'7'),'n1
 assert.equal(S.liveEntries(null).length, 0);
 assert.equal(S.liveEntries({}).length, 0);
 assert.equal(S.liveEntries({n1:{originalId:7}})[0].live, false);
+
+// Retained actions: an expired notification's sender is held so its id can
+// still be resolved to an action. Same id rules as live rows, but no live
+// predicate: holding the sender object is exactly what retention means.
+const held=(key,id,ts)=>({key,originalId:id,ts});
+assert.equal(S.findRetainedKey([held('n1',7,100)],'7'),'n1');
+assert.equal(S.findRetainedKey([held('n1',7,100)],7),'n1');
+assert.equal(S.findRetainedKey([held('n1',7,100),held('n2',8,200)],'8'),'n2');
+assert.equal(S.findRetainedKey([held('n1',7,100)],'8'),'');
+assert.equal(S.findRetainedKey([],'1'),'');
+assert.equal(S.findRetainedKey(null,'1'),'');
+for (const bad of ['',' 1','1 ','+1','-1','0','01','1.0','1e2','abc','NaN',1.5,null,undefined,{},[],'4294967296'])
+  assert.equal(S.findRetainedKey([held('n1',1,0)],bad),'');
+// The retained map shapes into rows for selection and pruning, dropping
+// empty slots rather than letting a half-written entry name a sender.
+assert.equal(JSON.stringify(S.retainedEntries({n1:{id:7,ts:100},n2:{id:8,ts:200}})),
+  JSON.stringify([{key:'n1',originalId:7,ts:100},{key:'n2',originalId:8,ts:200}]));
+assert.equal(S.retainedEntries(null).length,0);
+assert.equal(S.retainedEntries({n1:null}).length,0);
+// Prune: past the window first, then over the cap, oldest first; the caller
+// releases exactly these keys and nothing else.
+assert.equal(JSON.stringify(S.pruneRetained([held('old',1,0),held('mid',2,9000),held('new',3,9900)],10000,1,100)),
+  JSON.stringify(['old']));
+assert.equal(JSON.stringify(S.pruneRetained([held('a',1,1),held('b',2,2),held('c',3,3),held('d',4,4)],10,24,2)),
+  JSON.stringify(['a','b']));
+assert.equal(JSON.stringify(S.pruneRetained([held('a',1,1),held('b',2,2)],10,24,2)), JSON.stringify([]));
+assert.equal(JSON.stringify(S.pruneRetained([held('b',2,5),held('a',1,5)],10,24,1)),
+  JSON.stringify(['a']));
+assert.equal(S.pruneRetained([],100,24,100).length,0);
+assert.equal(S.pruneRetained(null,100,24,100).length,0);
+// Retention off (0 hours) releases everything, mirroring the store policy
+// where 0 disables history.
+assert.equal(JSON.stringify(S.pruneRetained([held('a',1,9),held('b',2,10)],10,0,100)),
+  JSON.stringify(['a','b']));
 console.log('baseline: passed');
